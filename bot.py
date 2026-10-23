@@ -10,6 +10,8 @@ STATE = "posted.json"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
+COVER = "https://livedoor.blogimg.jp/vtubernews/imgs/2/b/2b911902.png"  # 文章里没有图时的兜底封面
+
 SKIP = {"script", "style", "mark", "noscript"}
 BLOCKS = {"div", "dl", "dt", "dd", "p", "li", "ul", "ol", "section",
           "article", "table", "tr", "td", "h1", "h2", "h3", "h4", "h5", "h6"}
@@ -157,15 +159,18 @@ def build_page_nodes(entry):
     nodes = [b for b in to_nodes(body_html)
              if not any(r.match(plain_text(b)) for r in NOISE_RES)][:60]
     videos = [n for v in video_ids(body_html) for n in video_block(v)]
+    has_image = bool(videos) or any(b.get("tag") == "figure" for b in nodes)
+    cover = [] if has_image else [{"tag": "figure", "children": [
+        {"tag": "img", "attrs": {"src": COVER}}]}]
     head = [{"tag": "p", "children": [
         "出典: ", {"tag": "a", "attrs": {"href": entry.link}, "children": ["VTuberNews"]}]}]
     tail = [{"tag": "hr"}, {"tag": "p", "children": [
         {"tag": "a", "attrs": {"href": entry.link},
          "children": ["▶ 全文・コメントは元記事で読む"]}]}]
-    all_nodes = head + videos + nodes + tail
+    all_nodes = head + cover + videos + nodes + tail
     while len(json.dumps(all_nodes, ensure_ascii=False)) > 55000 and len(nodes) > 1:
         nodes.pop()
-        all_nodes = head + videos + nodes + tail
+        all_nodes = head + cover + videos + nodes + tail
     return all_nodes
 
 
@@ -199,25 +204,18 @@ def tg(bot_token, method, data):
 
 
 def send(bot_token, chat, title, page_url, vid=None):
-    text = f'{html.escape(title)}\n\n📖 <a href="{page_url}">阅读</a>'
-    if vid:  # 有视频：直接发视频缩略图，标题和“阅读”放在图片下方
-        try:
-            tg(bot_token, "sendPhoto", {
-                "chat_id": chat, "parse_mode": "HTML", "caption": text,
-                "photo": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"})
-            return
-        except Exception as ex:
-            print("缩略图发送失败，改发文字:", ex)
+    # 文字只有标题；末尾放一个看不见的链接，卡片（带缩略图）由 Telegram 生成，点卡片打开即时预览
+    text = f'{html.escape(title)}<a href="{page_url}">&#8203;</a>'
     tg(bot_token, "sendMessage", {
         "chat_id": chat, "parse_mode": "HTML", "text": text,
-        "link_preview_options": json.dumps({"url": page_url})})
+        "link_preview_options": json.dumps({"url": page_url, "prefer_large_media": True})})
 
 
 def main():
     bot_token = os.environ["BOT_TOKEN"]
     chat = os.environ["CHAT_ID"]
 
-    first_run = not os.path.exists(STATE)
+    first_run = not os.path.exists(STATE) or os.path.getsize(STATE) < 2
     posted = [] if first_run else json.load(open(STATE))
 
     resp = requests.get(FEED, headers={"User-Agent": UA}, timeout=30)
