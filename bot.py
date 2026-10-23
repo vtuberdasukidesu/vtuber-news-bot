@@ -20,6 +20,41 @@ def youtube_id(src):
     return m.group(1) if m else None
 
 
+VIDEO_RE = re.compile(
+    r"(?:youtube(?:-nocookie)?\.com/(?:watch\?(?:[^\s\"'<>]*?&)?v=|embed/|live/|shorts/)"
+    r"|youtu\.be/|[?&]yt=)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])")
+URL_RE = re.compile(r"(https?://[^\s<>\"']+)")
+NOISE_RES = [
+    re.compile(r"^\d+\.\s*名無し\S*$"),
+    re.compile(r"^\d{4}/\d{1,2}/\d{1,2}\(.\)\s*[\d:.]+(\s+ID:\S+)?$"),
+]
+
+
+def video_ids(html_text, limit=3):
+    seen = []
+    for m in VIDEO_RE.finditer(html_text or ""):
+        if m.group(1) not in seen:
+            seen.append(m.group(1))
+    return seen[:limit]
+
+
+def video_block(vid):
+    watch = "https://www.youtube.com/watch?v=" + vid
+    return {"tag": "figure", "children": [
+        {"tag": "iframe",
+         "attrs": {"src": "/embed/youtube?url=" + quote(watch, safe="")}}]}
+
+
+def plain_text(block):
+    out = []
+    for c in block.get("children", []):
+        if isinstance(c, str):
+            out.append(c)
+        elif isinstance(c, dict):
+            out.append(plain_text(c))
+    return "".join(out).strip()
+
+
 def good_href(href):
     return href.startswith("http") and not re.search(r"[\[\]() ]", href) and len(href) < 500
 
@@ -45,7 +80,11 @@ def to_nodes(content_html):
         if isinstance(el, NavigableString):
             t = re.sub(r"\s+", " ", str(el))
             if t.strip():
-                cur.append(t)
+                for part in URL_RE.split(t):
+                    if URL_RE.fullmatch(part) and good_href(part):
+                        cur.append({"tag": "a", "attrs": {"href": part}, "children": [part]})
+                    elif part:
+                        cur.append(part)
             return
         name = el.name
         if name in SKIP:
@@ -54,13 +93,6 @@ def to_nodes(content_html):
             cur.append({"tag": "br"})
             return
         if name == "iframe":
-            vid = youtube_id(el.get("src"))
-            if vid:
-                flush()
-                watch = "https://www.youtube.com/watch?v=" + vid
-                blocks.append({"tag": "figure", "children": [
-                    {"tag": "iframe",
-                     "attrs": {"src": "/embed/youtube?url=" + quote(watch, safe="")}}]})
             return
         if name == "img":
             src = el.get("src", "")
@@ -75,7 +107,7 @@ def to_nodes(content_html):
                     visit(c)
                 return
             text = el.get_text(" ", strip=True)
-            if not text:
+            if not text or text == "続きを読む":
                 return
             href = el.get("href", "")
             if good_href(href):
@@ -114,16 +146,18 @@ def build_page_nodes(entry):
         body_html = entry.content[0].value
     elif entry.get("summary"):
         body_html = entry.summary
-    nodes = to_nodes(body_html)[:60]
+    nodes = [b for b in to_nodes(body_html)
+             if not any(r.match(plain_text(b)) for r in NOISE_RES)][:60]
+    videos = [video_block(v) for v in video_ids(body_html)]
     head = [{"tag": "p", "children": [
         "出典: ", {"tag": "a", "attrs": {"href": entry.link}, "children": ["VTuberNews"]}]}]
     tail = [{"tag": "hr"}, {"tag": "p", "children": [
         {"tag": "a", "attrs": {"href": entry.link},
          "children": ["▶ 全文・コメントは元記事で読む"]}]}]
-    all_nodes = head + nodes + tail
+    all_nodes = head + videos + nodes + tail
     while len(json.dumps(all_nodes, ensure_ascii=False)) > 55000 and len(nodes) > 1:
         nodes.pop()
-        all_nodes = head + nodes + tail
+        all_nodes = head + videos + nodes + tail
     return all_nodes
 
 
