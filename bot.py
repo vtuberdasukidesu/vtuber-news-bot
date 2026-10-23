@@ -1,4 +1,4 @@
-import os, re, sys, json
+import os, re, sys, json, html
 from urllib.parse import quote
 
 import feedparser
@@ -39,10 +39,14 @@ def video_ids(html_text, limit=3):
 
 
 def video_block(vid):
-    watch = "https://www.youtube.com/watch?v=" + vid
-    return {"tag": "figure", "children": [
-        {"tag": "iframe",
-         "attrs": {"src": "/embed/youtube?url=" + quote(watch, safe="")}}]}
+    """Telegraph 页里放封面图 + 跳转链接（Telegraph 的 YouTube 嵌入会报错 153）"""
+    return [
+        {"tag": "figure", "children": [
+            {"tag": "img", "attrs": {"src": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"}}]},
+        {"tag": "p", "children": [
+            {"tag": "a", "attrs": {"href": f"https://youtu.be/{vid}"},
+             "children": ["▶ YouTube で再生"]}]},
+    ]
 
 
 def plain_text(block):
@@ -140,15 +144,19 @@ def to_nodes(content_html):
     return blocks
 
 
-def build_page_nodes(entry):
-    body_html = ""
+def body_html_of(entry):
     if entry.get("content"):
-        body_html = entry.content[0].value
-    elif entry.get("summary"):
-        body_html = entry.summary
+        return entry.content[0].value
+    if entry.get("summary"):
+        return entry.summary
+    return ""
+
+
+def build_page_nodes(entry):
+    body_html = body_html_of(entry)
     nodes = [b for b in to_nodes(body_html)
              if not any(r.match(plain_text(b)) for r in NOISE_RES)][:60]
-    videos = [video_block(v) for v in video_ids(body_html)]
+    videos = [n for v in video_ids(body_html) for n in video_block(v)]
     head = [{"tag": "p", "children": [
         "出典: ", {"tag": "a", "attrs": {"href": entry.link}, "children": ["VTuberNews"]}]}]
     tail = [{"tag": "hr"}, {"tag": "p", "children": [
@@ -184,9 +192,17 @@ def make_page(token, title, nodes):
     return j["result"]["url"]
 
 
-def send(bot_token, chat, title, url):
+def send(bot_token, chat, title, page_url, vid=None):
+    safe = html.escape(title)
+    data = {"chat_id": chat, "parse_mode": "HTML"}
+    if vid:
+        data["text"] = (f'{safe}\n\n📖 <a href="{page_url}">阅读全文（Telegram 内直接打开）</a>'
+                        f'\n▶️ <a href="https://youtu.be/{vid}">视频</a>')
+        data["link_preview_options"] = json.dumps({"url": f"https://youtu.be/{vid}"})
+    else:
+        data["text"] = f"{safe}\n{page_url}"
     r = requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                      data={"chat_id": chat, "text": f"{title}\n{url}"}, timeout=30)
+                      data=data, timeout=30)
     r.raise_for_status()
 
 
@@ -216,7 +232,8 @@ def main():
             except Exception as ex:
                 print("Telegraph 失败，改发原链接:", ex)
             try:
-                send(bot_token, chat, title, url)
+                vids = video_ids(body_html_of(e))
+                send(bot_token, chat, title, url, vids[0] if vids else None)
             except Exception as ex:
                 print("发送失败:", ex)
                 failed = True
