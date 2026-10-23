@@ -196,9 +196,9 @@ def send(bot_token, chat, title, page_url, vid=None):
     safe = html.escape(title)
     data = {"chat_id": chat, "parse_mode": "HTML"}
     if vid:
-        data["text"] = (f'{safe}\n\n📖 <a href="{page_url}">阅读全文（Telegram 内直接打开）</a>'
-                        f'\n▶️ <a href="https://youtu.be/{vid}">视频</a>')
-        data["link_preview_options"] = json.dumps({"url": f"https://youtu.be/{vid}"})
+        # 消息里第一个链接决定预览卡片：视频链接放最前 → 显示 YouTube 缩略图，可直接播放
+        data["text"] = (f'{safe}\n\n▶️ <a href="https://youtu.be/{vid}">视频</a>'
+                        f'　📖 <a href="{page_url}">阅读</a>')
     else:
         data["text"] = f"{safe}\n{page_url}"
     r = requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage",
