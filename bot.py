@@ -32,6 +32,43 @@ NOISE_RES = [
 ]
 
 
+YT_LINK_RE = re.compile(
+    r"(?:youtube(?:-nocookie)?\.com/(?:watch\?(?:[^\s\"'<>]*?&)?v=|embed/|live/|shorts/)"
+    r"|youtu\.be/)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])")
+T_RE = re.compile(r"[?&#](?:t|start)=([0-9hms]+)")
+
+
+def to_seconds(v):
+    if v.isdigit():
+        return int(v)
+    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", v)
+    if not m or not any(m.groups()):
+        return None
+    h, mi, sec = (int(x or 0) for x in m.groups())
+    return h * 3600 + mi * 60 + sec
+
+
+def yt_link(href):
+    """YouTube 链接 → (视频ID, 秒数或None, 规范短链接 youtu.be/ID?t=秒)；不是 YouTube 则返回 None"""
+    m = YT_LINK_RE.search(href or "")
+    if not m:
+        return None
+    vid = m.group(1)
+    tm = T_RE.search(href)
+    t = to_seconds(tm.group(1)) if tm else None
+    return vid, t, f"https://youtu.be/{vid}" + (f"?t={t}" if t else "")
+
+
+def video_times(html_text):
+    """文章里每个视频出现过的时间戳 {视频ID: {秒数,...}}"""
+    times = {}
+    for a in BeautifulSoup(html_text or "", "html.parser").find_all("a", href=True):
+        y = yt_link(a["href"])
+        if y and y[1]:
+            times.setdefault(y[0], set()).add(y[1])
+    return times
+
+
 def video_ids(html_text, limit=3):
     seen = []
     for m in VIDEO_RE.finditer(html_text or ""):
@@ -40,14 +77,14 @@ def video_ids(html_text, limit=3):
     return seen[:limit]
 
 
-def video_block(vid):
+def video_block(vid, t=None):
     """Telegraph 页里放封面图 + 跳转链接（Telegraph 的 YouTube 嵌入会报错 153）"""
     return [
         {"tag": "figure", "children": [
             {"tag": "img", "attrs": {"src": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"}}]},
         {"tag": "p", "children": [
-            {"tag": "a", "attrs": {"href": f"https://youtu.be/{vid}"},
-             "children": ["▶ YouTube で再生"]}]},
+            {"tag": "a", "attrs": {"href": f"https://youtu.be/{vid}" + (f"?t={t}" if t else "")},
+             "children": ["▶ YouTube で再生" + (" （該当シーンから）" if t else "")]}]},
     ]
 
 
@@ -88,7 +125,9 @@ def to_nodes(content_html):
             if t.strip():
                 for part in URL_RE.split(t):
                     if URL_RE.fullmatch(part) and good_href(part):
-                        cur.append({"tag": "a", "attrs": {"href": part}, "children": [part]})
+                        y = yt_link(part)
+                        cur.append({"tag": "a", "attrs": {"href": y[2] if y else part},
+                                    "children": [part]})
                     elif part:
                         cur.append(part)
             return
@@ -116,6 +155,9 @@ def to_nodes(content_html):
             if not text or text == "続きを読む":
                 return
             href = el.get("href", "")
+            y = yt_link(href)
+            if y:
+                href = y[2]
             if good_href(href):
                 cur.append({"tag": "a", "attrs": {"href": href}, "children": [text]})
             else:
@@ -158,7 +200,11 @@ def build_page_nodes(entry):
     body_html = body_html_of(entry)
     nodes = [b for b in to_nodes(body_html)
              if not any(r.match(plain_text(b)) for r in NOISE_RES)][:60]
-    videos = [n for v in video_ids(body_html) for n in video_block(v)]
+    times = video_times(body_html)
+    videos = []
+    for v in video_ids(body_html):
+        ts = times.get(v, set())
+        videos += video_block(v, next(iter(ts)) if len(ts) == 1 else None)
     has_image = bool(videos) or any(b.get("tag") == "figure" for b in nodes)
     cover = [] if has_image else [{"tag": "figure", "children": [
         {"tag": "img", "attrs": {"src": COVER}}]}]
