@@ -192,18 +192,25 @@ def make_page(token, title, nodes):
     return j["result"]["url"]
 
 
-def send(bot_token, chat, title, page_url, vid=None):
-    safe = html.escape(title)
-    data = {"chat_id": chat, "parse_mode": "HTML"}
-    if vid:
-        # 消息里第一个链接决定预览卡片：视频链接放最前 → 显示 YouTube 缩略图，可直接播放
-        data["text"] = (f'{safe}\n\n▶️ <a href="https://youtu.be/{vid}">视频</a>'
-                        f'　📖 <a href="{page_url}">阅读</a>')
-    else:
-        data["text"] = f"{safe}\n{page_url}"
-    r = requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage",
+def tg(bot_token, method, data):
+    r = requests.post(f"https://api.telegram.org/bot{bot_token}/{method}",
                       data=data, timeout=30)
     r.raise_for_status()
+
+
+def send(bot_token, chat, title, page_url, vid=None):
+    text = f'{html.escape(title)}\n\n📖 <a href="{page_url}">阅读</a>'
+    if vid:  # 有视频：直接发视频缩略图，标题和“阅读”放在图片下方
+        try:
+            tg(bot_token, "sendPhoto", {
+                "chat_id": chat, "parse_mode": "HTML", "caption": text,
+                "photo": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"})
+            return
+        except Exception as ex:
+            print("缩略图发送失败，改发文字:", ex)
+    tg(bot_token, "sendMessage", {
+        "chat_id": chat, "parse_mode": "HTML", "text": text,
+        "link_preview_options": json.dumps({"url": page_url})})
 
 
 def main():
