@@ -1,5 +1,4 @@
-import os, re, sys, json, html
-from urllib.parse import quote
+import os, re, sys, json, html, time
 
 import feedparser
 import requests
@@ -16,12 +15,6 @@ SKIP = {"script", "style", "mark", "noscript"}
 BLOCKS = {"div", "dl", "dt", "dd", "p", "li", "ul", "ol", "section",
           "article", "table", "tr", "td", "h1", "h2", "h3", "h4", "h5", "h6"}
 
-
-def youtube_id(src):
-    m = re.search(r"youtube(?:-nocookie)?\.com/embed/([\w-]{6,})", src or "")
-    return m.group(1) if m else None
-
-
 VIDEO_RE = re.compile(
     r"(?:youtube(?:-nocookie)?\.com/(?:watch\?(?:[^\s\"'<>]*?&)?v=|embed/|live/|shorts/)"
     r"|youtu\.be/|[?&]yt=)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])")
@@ -30,8 +23,6 @@ NOISE_RES = [
     re.compile(r"^\d+\.\s*名無し\S*$"),
     re.compile(r"^\d{4}/\d{1,2}/\d{1,2}\(.\)\s*[\d:.]+(\s+ID:\S+)?$"),
 ]
-
-
 YT_LINK_RE = re.compile(
     r"(?:youtube(?:-nocookie)?\.com/(?:watch\?(?:[^\s\"'<>]*?&)?v=|embed/|live/|shorts/)"
     r"|youtu\.be/)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])")
@@ -84,7 +75,7 @@ def video_block(vid, t=None):
             {"tag": "img", "attrs": {"src": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"}}]},
         {"tag": "p", "children": [
             {"tag": "a", "attrs": {"href": f"https://youtu.be/{vid}" + (f"?t={t}" if t else "")},
-             "children": ["▶ YouTube で再生" + (" （該当シーンから）" if t else "")]}]},
+             "children": ["▶ YouTube で再生"]}]},
     ]
 
 
@@ -220,6 +211,40 @@ def build_page_nodes(entry):
     return all_nodes
 
 
+def simplify(nodes):
+    """精简版：只留文字、视频封面和 youtu.be / 原站链接，用于完整版反复失败时"""
+    def flat(children):
+        out = []
+        for c in children:
+            if isinstance(c, str):
+                out.append(c)
+            elif c.get("tag") == "br":
+                out.append(c)
+            elif c.get("tag") == "a":
+                href = c.get("attrs", {}).get("href", "")
+                if href.startswith("https://youtu.be/") or "vtubernews.jp" in href:
+                    out.append(c)
+                else:
+                    out.append(plain_text(c))
+            else:
+                out.extend(flat(c.get("children", [])))
+        return out
+
+    out = []
+    for n in nodes:
+        t = n.get("tag")
+        if t == "figure":
+            if any("ytimg.com" in c.get("attrs", {}).get("src", "") for c in n["children"]):
+                out.append(n)
+        elif t == "hr":
+            out.append(n)
+        elif t in ("p", "blockquote"):
+            kids = flat(n.get("children", []))
+            if kids:
+                out.append({"tag": "p", "children": kids})
+    return out
+
+
 def telegraph_token():
     r = requests.post("https://api.telegra.ph/createAccount", data={
         "short_name": "vtubernews", "author_name": "VTuberNews"}, timeout=30)
@@ -241,6 +266,33 @@ def make_page(token, title, nodes):
     if not j.get("ok"):
         raise RuntimeError(j)
     return j["result"]["url"]
+
+
+_TOKEN = None
+
+
+def get_token():
+    global _TOKEN
+    if _TOKEN is None:
+        _TOKEN = telegraph_token()
+    return _TOKEN
+
+
+def publish_page(title, full, simple):
+    """创建 Telegraph 页面：失败就等一会儿重试；前 2 次用完整版，后面用精简版"""
+    last = None
+    for i, wait in enumerate([0, 5, 20, 45]):
+        if wait:
+            time.sleep(wait)
+        try:
+            return make_page(get_token(), title, full if i < 2 else simple)
+        except Exception as ex:
+            last = ex
+            print(f"Telegraph 第 {i + 1} 次失败（{'完整版' if i < 2 else '精简版'}）: {ex}")
+            m = re.search(r"FLOOD_WAIT_(\d+)", str(ex))
+            if m:
+                time.sleep(min(int(m.group(1)), 60))
+    raise last
 
 
 def tg(bot_token, method, data):
@@ -268,20 +320,18 @@ def main():
     resp.raise_for_status()
     feed = feedparser.parse(resp.content)
 
-    tg_token = None
     failed = False
     for e in reversed(feed.entries[:15]):
         if e.link in posted:
             continue
         if not first_run:
             title = e.title.strip()
-            url = e.link  # Telegraph 失败时，退回发原链接
+            url = e.link  # Telegraph 实在失败时，退回发原链接
             try:
-                if tg_token is None:
-                    tg_token = telegraph_token()
-                url = make_page(tg_token, title, build_page_nodes(e))
+                full = build_page_nodes(e)
+                url = publish_page(title, full, simplify(full))
             except Exception as ex:
-                print("Telegraph 失败，改发原链接:", ex)
+                print(f"Telegraph 最终失败，改发原链接（{title[:30]}）:", ex)
             try:
                 vids = video_ids(body_html_of(e))
                 send(bot_token, chat, title, url, vids[0] if vids else None)
