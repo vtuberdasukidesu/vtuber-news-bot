@@ -1,4 +1,4 @@
-import os, re, sys, json, html, time
+import os, re, sys, json, html, time, copy
 from urllib.parse import quote
 
 import feedparser
@@ -12,9 +12,15 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 COVER = "https://livedoor.blogimg.jp/vtubernews/imgs/2/b/2b911902.png"  # 文章里没有图时的兜底封面
 
-# 图片代理开关：如果你的电脑端打不开 i.ytimg.com / pbs.twimg.com（需要翻墙的域名），
-# 导致 Telegraph 里的视频封面、推特图片丢失，可以把 False 改成 True，让图片走 images.weserv.nl 中转
-IMG_PROXY = False
+# ── 图片显示相关开关 ──────────────────────────────────────────────
+# 1) UPLOAD_IMAGES：先尝试把图片转存到 Telegraph 自己的服务器（这样哪里都能看到）。
+#    这个上传接口是非官方的，据说可能已被关闭；失败会自动跳过，不影响发帖。
+UPLOAD_IMAGES = True
+# 2) IMG_PROXY：转存失败时，图片改走 images.weserv.nl 中转，解决电脑端打不开
+#    i.ytimg.com / pbs.twimg.com 导致正文无图的问题。想完全用原图地址就改成 False。
+IMG_PROXY = True
+MAX_UPLOADS = 40  # 每次运行最多转存多少张图
+# ────────────────────────────────────────────────────────────────
 
 SKIP = {"script", "style", "mark", "noscript"}
 BLOCKS = {"div", "dl", "dt", "dd", "p", "li", "ul", "ol", "section",
@@ -43,12 +49,79 @@ def clean(s):
     return s.encode("utf-16", "surrogatepass").decode("utf-16", "ignore")
 
 
-def img_url(url):
-    """推特图用 large 尺寸（orig 可能太大）；开启代理开关时走 weserv 中转"""
-    url = url.replace("name=orig", "name=large")
-    if IMG_PROXY and not url.startswith("https://images.weserv.nl/"):
-        return "https://images.weserv.nl/?url=" + quote(url, safe="") + "&w=1280"
-    return url
+def fix_img(url):
+    """推特图用 large 尺寸（orig 可能太大）"""
+    return url.replace("name=orig", "name=large")
+
+
+def proxy_url(url):
+    return "https://images.weserv.nl/?url=" + quote(url, safe="") + "&w=1280"
+
+
+# ── 图片转存 / 代理（在创建 Telegraph 页面前统一处理，结果有缓存）──────────
+_IMG_CACHE = {}
+_UPLOAD_FAILS = 0
+_UPLOADED = 0
+
+
+def upload_image(url):
+    """下载图片并传到 Telegraph；失败返回 None。连续失败 2 次后本次运行不再尝试"""
+    global _UPLOAD_FAILS, _UPLOADED
+    if _UPLOAD_FAILS >= 2 or _UPLOADED >= MAX_UPLOADS:
+        return None
+    try:
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=15)
+        r.raise_for_status()
+        data = r.content
+        if not data or len(data) > 5_000_000:
+            return None  # 空文件或超过 5MB，不算上传接口的问题
+        ctype = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip()
+        ext = {"image/png": "png", "image/gif": "gif", "image/jpeg": "jpg"}.get(ctype)
+        if ext is None:
+            return None  # Telegraph 只收 jpg/png/gif
+        up = requests.post("https://telegra.ph/upload",
+                           files={"file": (f"img.{ext}", data, ctype)}, timeout=30)
+        try:
+            src = up.json()[0]["src"]
+        except Exception:
+            raise RuntimeError(f"上传接口返回异常: HTTP {up.status_code} {up.text[:100]}")
+        if not str(src).startswith("/file/"):
+            raise RuntimeError(f"意外的返回: {up.text[:100]}")
+        _UPLOAD_FAILS = 0
+        _UPLOADED += 1
+        return src
+    except Exception as ex:
+        _UPLOAD_FAILS += 1
+        print(f"图片转存失败（{url[:60]}）: {ex}")
+        return None
+
+
+def final_src(src):
+    if src in _IMG_CACHE:
+        return _IMG_CACHE[src]
+    out = None
+    if UPLOAD_IMAGES and src.startswith("http"):
+        out = upload_image(src)
+    if not out:
+        out = proxy_url(src) if (IMG_PROXY and src.startswith("http")) else src
+    _IMG_CACHE[src] = out
+    return out
+
+
+def finalize_images(nodes):
+    out = []
+    for n in nodes:
+        if isinstance(n, str):
+            out.append(n)
+            continue
+        n = dict(n)
+        if n.get("tag") == "img":
+            n["attrs"] = {**n["attrs"], "src": final_src(n["attrs"]["src"])}
+        elif "children" in n:
+            n["children"] = finalize_images(n["children"])
+        out.append(n)
+    return out
+# ────────────────────────────────────────────────────────────────
 
 
 def to_seconds(v):
@@ -94,7 +167,7 @@ def video_block(vid, t=None):
     """Telegraph 页里放封面图 + 跳转链接（Telegraph 的 YouTube 嵌入会报错 153）"""
     return [
         {"tag": "figure", "children": [
-            {"tag": "img", "attrs": {"src": img_url(f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg")}}]},
+            {"tag": "img", "attrs": {"src": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"}}]},
         {"tag": "p", "children": [
             {"tag": "a", "attrs": {"href": f"https://youtu.be/{vid}" + (f"?t={t}" if t else "")},
              "children": ["▶ YouTube で再生"]}]},
@@ -157,7 +230,7 @@ def to_nodes(content_html):
             if src.startswith("http") and "twi-user-img" not in (el.get("class") or []):
                 flush()
                 blocks.append({"tag": "figure", "children": [
-                    {"tag": "img", "attrs": {"src": img_url(src)}}]})
+                    {"tag": "img", "attrs": {"src": fix_img(src)}}]})
             return
         if name == "a":
             if el.find("img") or el.find("iframe"):
@@ -216,7 +289,7 @@ def prune(nodes):
             out.append({"tag": tag})
             continue
         if tag == "img":
-            if attrs.get("src", "").startswith("http"):
+            if attrs.get("src", "").startswith(("http", "/file/")):
                 out.append({"tag": "img", "attrs": attrs})
             continue
         kids = prune(n.get("children", []))
@@ -253,8 +326,8 @@ def build_page_nodes(entry):
         videos += video_block(v, next(iter(ts)) if len(ts) == 1 else None)
     has_image = bool(videos) or any(b.get("tag") == "figure" for b in nodes)
     cover = [] if has_image else [{"tag": "figure", "children": [
-        {"tag": "img", "attrs": {"src": img_url(COVER)}}]}]
-    
+        {"tag": "img", "attrs": {"src": COVER}}]}]
+
     tail = [{"tag": "hr"}, {"tag": "p", "children": [
         {"tag": "a", "attrs": {"href": entry.link},
          "children": ["コメントは元記事で読む"]}]}]
@@ -302,8 +375,7 @@ def simplify(nodes):
 def minimal_nodes(entry, title):
     """最小版：只有出处、标题和原文链接，保证页面能建出来"""
     return prune([
-        {"tag": "p", "children": ["出典: ", {"tag": "a", "attrs": {"href": entry.link},
-                                            "children": ["VTuberNews"]}]},
+       
         {"tag": "p", "children": [title]},
         {"tag": "p", "children": [{"tag": "a", "attrs": {"href": entry.link},
                                    "children": ["コメントは元記事で読む"]}]},
@@ -351,16 +423,24 @@ def get_token(reset=False):
 
 
 def publish_page(title, full, simple, minimal):
-    """创建 Telegraph 页面，逐级降级：完整版×2 → 精简版（短标题、新账号）→ 最小版（更短标题）"""
-    plans = [("完整版", full, 256), ("完整版", full, 256),
-             ("精简版", simple, 60), ("最小版", minimal, 30)]
+    """创建 Telegraph 页面，逐级降级。
+
+    从日志看，标题过长（约 70 字以上）时 Telegraph 会返回 PAGE_SAVE_FAILED，
+    所以页面标题一开始就截到 60 字（频道消息里仍然是完整标题）。
+    顺序：完整版/60字 → 完整版/45字+新账号 → 精简版/45字 → 最小版/30字
+    """
+    plans = [("完整版", full, 60, False), ("完整版", full, 45, True),
+             ("精简版", simple, 45, False), ("最小版", minimal, 30, False)]
     last = None
-    for i, (name, nodes, tlen) in enumerate(plans):
+    for i, (name, nodes, tlen, new_acc) in enumerate(plans):
         if i:
             time.sleep([0, 5, 10, 20][i])
         t = shorten(title, tlen)
         try:
-            return make_page(get_token(reset=(i == 2)), t, nodes)
+            url = make_page(get_token(reset=new_acc), t, finalize_images(nodes))
+            if i:
+                print(f"Telegraph 在第 {i + 1} 次（{name}，标题 {len(t)} 字）才成功，内容可能不完整")
+            return url
         except Exception as ex:
             last = ex
             print(f"Telegraph 第 {i + 1} 次失败（{name}，标题 {len(t)} 字，"
