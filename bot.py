@@ -202,7 +202,7 @@ def build_page_nodes(entry):
     
     tail = [{"tag": "hr"}, {"tag": "p", "children": [
         {"tag": "a", "attrs": {"href": entry.link},
-         "children": ["▶ コメントは元記事で読む"]}]}]
+         "children": ["コメントはこちら"]}]}]
     all_nodes = cover + videos + nodes + tail
     while len(json.dumps(all_nodes, ensure_ascii=False)) > 55000 and len(nodes) > 1:
         nodes.pop()
