@@ -1,5 +1,4 @@
-import os, re, sys, json, html
-from urllib.parse import quote
+import os, re, sys, json, html, time
 
 import feedparser
 import requests
@@ -16,12 +15,6 @@ SKIP = {"script", "style", "mark", "noscript"}
 BLOCKS = {"div", "dl", "dt", "dd", "p", "li", "ul", "ol", "section",
           "article", "table", "tr", "td", "h1", "h2", "h3", "h4", "h5", "h6"}
 
-
-def youtube_id(src):
-    m = re.search(r"youtube(?:-nocookie)?\.com/embed/([\w-]{6,})", src or "")
-    return m.group(1) if m else None
-
-
 VIDEO_RE = re.compile(
     r"(?:youtube(?:-nocookie)?\.com/(?:watch\?(?:[^\s\"'<>]*?&)?v=|embed/|live/|shorts/)"
     r"|youtu\.be/|[?&]yt=)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])")
@@ -30,6 +23,41 @@ NOISE_RES = [
     re.compile(r"^\d+\.\s*名無し\S*$"),
     re.compile(r"^\d{4}/\d{1,2}/\d{1,2}\(.\)\s*[\d:.]+(\s+ID:\S+)?$"),
 ]
+YT_LINK_RE = re.compile(
+    r"(?:youtube(?:-nocookie)?\.com/(?:watch\?(?:[^\s\"'<>]*?&)?v=|embed/|live/|shorts/)"
+    r"|youtu\.be/)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])")
+T_RE = re.compile(r"[?&#](?:t|start)=([0-9hms]+)")
+
+
+def to_seconds(v):
+    if v.isdigit():
+        return int(v)
+    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", v)
+    if not m or not any(m.groups()):
+        return None
+    h, mi, sec = (int(x or 0) for x in m.groups())
+    return h * 3600 + mi * 60 + sec
+
+
+def yt_link(href):
+    """YouTube 链接 → (视频ID, 秒数或None, 规范短链接 youtu.be/ID?t=秒)；不是 YouTube 则返回 None"""
+    m = YT_LINK_RE.search(href or "")
+    if not m:
+        return None
+    vid = m.group(1)
+    tm = T_RE.search(href)
+    t = to_seconds(tm.group(1)) if tm else None
+    return vid, t, f"https://youtu.be/{vid}" + (f"?t={t}" if t else "")
+
+
+def video_times(html_text):
+    """文章里每个视频出现过的时间戳 {视频ID: {秒数,...}}"""
+    times = {}
+    for a in BeautifulSoup(html_text or "", "html.parser").find_all("a", href=True):
+        y = yt_link(a["href"])
+        if y and y[1]:
+            times.setdefault(y[0], set()).add(y[1])
+    return times
 
 
 def video_ids(html_text, limit=3):
@@ -40,13 +68,13 @@ def video_ids(html_text, limit=3):
     return seen[:limit]
 
 
-def video_block(vid):
+def video_block(vid, t=None):
     """Telegraph 页里放封面图 + 跳转链接（Telegraph 的 YouTube 嵌入会报错 153）"""
     return [
         {"tag": "figure", "children": [
             {"tag": "img", "attrs": {"src": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"}}]},
         {"tag": "p", "children": [
-            {"tag": "a", "attrs": {"href": f"https://youtu.be/{vid}"},
+            {"tag": "a", "attrs": {"href": f"https://youtu.be/{vid}" + (f"?t={t}" if t else "")},
              "children": ["▶ YouTube で再生"]}]},
     ]
 
@@ -88,7 +116,9 @@ def to_nodes(content_html):
             if t.strip():
                 for part in URL_RE.split(t):
                     if URL_RE.fullmatch(part) and good_href(part):
-                        cur.append({"tag": "a", "attrs": {"href": part}, "children": [part]})
+                        y = yt_link(part)
+                        cur.append({"tag": "a", "attrs": {"href": y[2] if y else part},
+                                    "children": [part]})
                     elif part:
                         cur.append(part)
             return
@@ -116,6 +146,9 @@ def to_nodes(content_html):
             if not text or text == "続きを読む":
                 return
             href = el.get("href", "")
+            y = yt_link(href)
+            if y:
+                href = y[2]
             if good_href(href):
                 cur.append({"tag": "a", "attrs": {"href": href}, "children": [text]})
             else:
@@ -158,11 +191,15 @@ def build_page_nodes(entry):
     body_html = body_html_of(entry)
     nodes = [b for b in to_nodes(body_html)
              if not any(r.match(plain_text(b)) for r in NOISE_RES)][:60]
-    videos = [n for v in video_ids(body_html) for n in video_block(v)]
+    times = video_times(body_html)
+    videos = []
+    for v in video_ids(body_html):
+        ts = times.get(v, set())
+        videos += video_block(v, next(iter(ts)) if len(ts) == 1 else None)
     has_image = bool(videos) or any(b.get("tag") == "figure" for b in nodes)
     cover = [] if has_image else [{"tag": "figure", "children": [
         {"tag": "img", "attrs": {"src": COVER}}]}]
-   
+    
     tail = [{"tag": "hr"}, {"tag": "p", "children": [
         {"tag": "a", "attrs": {"href": entry.link},
          "children": ["▶ コメントは元記事で読む"]}]}]
@@ -171,6 +208,40 @@ def build_page_nodes(entry):
         nodes.pop()
         all_nodes = cover + videos + nodes + tail
     return all_nodes
+
+
+def simplify(nodes):
+    """精简版：只留文字、视频封面和 youtu.be / 原站链接，用于完整版反复失败时"""
+    def flat(children):
+        out = []
+        for c in children:
+            if isinstance(c, str):
+                out.append(c)
+            elif c.get("tag") == "br":
+                out.append(c)
+            elif c.get("tag") == "a":
+                href = c.get("attrs", {}).get("href", "")
+                if href.startswith("https://youtu.be/") or "vtubernews.jp" in href:
+                    out.append(c)
+                else:
+                    out.append(plain_text(c))
+            else:
+                out.extend(flat(c.get("children", [])))
+        return out
+
+    out = []
+    for n in nodes:
+        t = n.get("tag")
+        if t == "figure":
+            if any("ytimg.com" in c.get("attrs", {}).get("src", "") for c in n["children"]):
+                out.append(n)
+        elif t == "hr":
+            out.append(n)
+        elif t in ("p", "blockquote"):
+            kids = flat(n.get("children", []))
+            if kids:
+                out.append({"tag": "p", "children": kids})
+    return out
 
 
 def telegraph_token():
@@ -194,6 +265,33 @@ def make_page(token, title, nodes):
     if not j.get("ok"):
         raise RuntimeError(j)
     return j["result"]["url"]
+
+
+_TOKEN = None
+
+
+def get_token():
+    global _TOKEN
+    if _TOKEN is None:
+        _TOKEN = telegraph_token()
+    return _TOKEN
+
+
+def publish_page(title, full, simple):
+    """创建 Telegraph 页面：失败就等一会儿重试；前 2 次用完整版，后面用精简版"""
+    last = None
+    for i, wait in enumerate([0, 5, 20, 45]):
+        if wait:
+            time.sleep(wait)
+        try:
+            return make_page(get_token(), title, full if i < 2 else simple)
+        except Exception as ex:
+            last = ex
+            print(f"Telegraph 第 {i + 1} 次失败（{'完整版' if i < 2 else '精简版'}）: {ex}")
+            m = re.search(r"FLOOD_WAIT_(\d+)", str(ex))
+            if m:
+                time.sleep(min(int(m.group(1)), 60))
+    raise last
 
 
 def tg(bot_token, method, data):
@@ -221,20 +319,18 @@ def main():
     resp.raise_for_status()
     feed = feedparser.parse(resp.content)
 
-    tg_token = None
     failed = False
     for e in reversed(feed.entries[:15]):
         if e.link in posted:
             continue
         if not first_run:
             title = e.title.strip()
-            url = e.link  # Telegraph 失败时，退回发原链接
+            url = e.link  # Telegraph 实在失败时，退回发原链接
             try:
-                if tg_token is None:
-                    tg_token = telegraph_token()
-                url = make_page(tg_token, title, build_page_nodes(e))
+                full = build_page_nodes(e)
+                url = publish_page(title, full, simplify(full))
             except Exception as ex:
-                print("Telegraph 失败，改发原链接:", ex)
+                print(f"Telegraph 最终失败，改发原链接（{title[:30]}）:", ex)
             try:
                 vids = video_ids(body_html_of(e))
                 send(bot_token, chat, title, url, vids[0] if vids else None)
