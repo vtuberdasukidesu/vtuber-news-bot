@@ -22,6 +22,12 @@ IMG_PROXY = True
 MAX_UPLOADS = 40  # 每次运行最多转存多少张图
 # ────────────────────────────────────────────────────────────────
 
+# 发帖防重复开关：
+# False（推荐）：Telegram 超时、说不准消息有没有发出去时，不重试，按“已发送”处理（不会重复发帖，
+#               但极少数情况下如果消息其实没发出去，这篇会被漏掉）
+# True：这种情况也重试（不会漏发，但可能在频道里重复发一条）
+RETRY_ON_AMBIGUOUS = False
+
 SKIP = {"script", "style", "mark", "noscript"}
 BLOCKS = {"div", "dl", "dt", "dd", "p", "li", "ul", "ol", "section",
           "article", "table", "tr", "td", "h1", "h2", "h3", "h4", "h5", "h6"}
@@ -373,9 +379,8 @@ def simplify(nodes):
 
 
 def minimal_nodes(entry, title):
-    """最小版：只有出处、标题和原文链接，保证页面能建出来"""
+    """最小版：只有标题和原文链接，保证页面能建出来"""
     return prune([
-       
         {"tag": "p", "children": [title]},
         {"tag": "p", "children": [{"tag": "a", "attrs": {"href": entry.link},
                                    "children": ["コメントは元記事で読む"]}]},
@@ -452,8 +457,21 @@ def publish_page(title, full, simple, minimal):
     raise last
 
 
+def _not_sent(ex):
+    """能确定请求根本没送到 Telegram 的错误"""
+    s = str(ex)
+    return (isinstance(ex, requests.exceptions.ConnectTimeout)
+            or "Failed to establish a new connection" in s
+            or "Temporary failure in name resolution" in s)
+
+
 def tg(bot_token, method, data):
-    """调用 Telegram 接口：超时或失败时自动重试（极少数情况下可能因此重复发出一条）"""
+    """调用 Telegram 接口。
+    - 请求没送到（连不上）、429：消息肯定没发出去，自动重试
+    - 读超时 / 连接中途断开 / 5xx：请求可能已经送到，消息说不定已经发出去了。
+      默认不重试，记为已发送（避免频道里出现重复帖）
+    - 其他错误（如 400 参数错误）：直接报错
+    """
     last = None
     for i, wait in enumerate([0, 3, 8]):
         if wait:
@@ -461,19 +479,33 @@ def tg(bot_token, method, data):
         try:
             r = requests.post(f"https://api.telegram.org/bot{bot_token}/{method}",
                               data=data, timeout=45)
-            if r.status_code == 429:
-                try:
-                    ra = int(r.json().get("parameters", {}).get("retry_after", 5))
-                except Exception:
-                    ra = 5
-                time.sleep(min(ra, 30))
-                last = RuntimeError("429 Too Many Requests")
-                continue
-            r.raise_for_status()
-            return
         except Exception as ex:
-            last = ex
-            print(f"Telegram 第 {i + 1} 次请求失败: {ex}")
+            if _not_sent(ex):
+                last = ex
+                print(f"Telegram 第 {i + 1} 次连接失败（消息没发出，重试）: {ex}")
+                continue
+            print(f"Telegram 请求中断，消息可能已经发出: {ex}")
+            if RETRY_ON_AMBIGUOUS:
+                last = ex
+                continue
+            return
+        if r.status_code == 429:
+            try:
+                ra = int(r.json().get("parameters", {}).get("retry_after", 5))
+            except Exception:
+                ra = 5
+            print(f"Telegram 限流，等待 {min(ra, 30)} 秒后重试")
+            time.sleep(min(ra, 30))
+            last = RuntimeError("429 Too Many Requests")
+            continue
+        if r.status_code >= 500:
+            print(f"Telegram 返回 {r.status_code}，消息可能已经发出")
+            if RETRY_ON_AMBIGUOUS:
+                last = RuntimeError(f"HTTP {r.status_code}")
+                continue
+            return
+        r.raise_for_status()
+        return
     raise last
 
 
