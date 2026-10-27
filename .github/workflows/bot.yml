@@ -1,7 +1,7 @@
 name: bot
 on:
   schedule:
-    - cron: "*/20 * * * *"
+    - cron: "3,13,23,33,43,53 * * * *"
   workflow_dispatch:
 permissions:
   contents: write
@@ -11,6 +11,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
