@@ -33,8 +33,8 @@ BLOCKS = {"div", "dl", "dt", "dd", "p", "li", "ul", "ol", "section",
           "article", "table", "tr", "td", "h1", "h2", "h3", "h4", "h5", "h6"}
 
 VIDEO_RE = re.compile(
-    r"(?:youtube(?:-nocookie)?\.com/(?:watch\?(?:[^\s\"'<>]*?&)?v=|embed/|live/|shorts/)"
-    r"|youtu\.be/|[?&]yt=)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])")
+    r"(?:youtube(?:-nocookie)?\.com/(?:watch\?(?:[^\s\"'<>]*?&)?v=|embed/|live/|shorts/|v/)"
+    r"|youtu\.be/|ytimg\.com/vi(?:_webp)?/|[?&]yt=)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])")
 URL_RE = re.compile(r"(https?://[^\s<>\"']+)")
 NOISE_RES = [
     re.compile(r"^\d+\.\s*名無し\S*$"),
@@ -167,6 +167,32 @@ def video_ids(html_text, limit=3):
         if m.group(1) not in seen:
             seen.append(m.group(1))
     return seen[:limit]
+
+
+def find_videos(entry):
+    """先在 RSS 正文里找视频；找不到时，再去原文页面的正文区域（div.article-body）里找一次"""
+    body = body_html_of(entry)
+    ids = video_ids(body)
+    if ids:
+        return ids
+    try:
+        r = requests.get(entry.link, headers={"User-Agent": UA}, timeout=20)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        area = soup.select_one("div.article-body")
+        if area is None:
+            print(f"原文页面里没找到正文区域，无法补查视频: {entry.link}")
+        else:
+            ids = video_ids(str(area))
+            if ids:
+                print(f"RSS 里没有视频，已从原文页面补上: {ids}")
+                return ids
+    except Exception as ex:
+        print(f"读取原文页面失败，无法补查视频: {ex}")
+    if "youtu" in body or "<iframe" in body:
+        i = max(body.find("youtu"), body.find("<iframe"), 0)
+        print("【诊断】正文里像是有视频，但没识别出来，片段:", body[max(0, i - 80):i + 220].replace("\n", " "))
+    return []
 
 
 def video_block(vid, t=None):
@@ -321,13 +347,15 @@ def body_html_of(entry):
     return ""
 
 
-def build_page_nodes(entry):
+def build_page_nodes(entry, vids=None):
     body_html = body_html_of(entry)
+    if vids is None:
+        vids = video_ids(body_html)
     nodes = [b for b in to_nodes(body_html)
              if not any(r.match(plain_text(b)) for r in NOISE_RES)][:60]
     times = video_times(body_html)
     videos = []
-    for v in video_ids(body_html):
+    for v in vids:
         ts = times.get(v, set())
         videos += video_block(v, next(iter(ts)) if len(ts) == 1 else None)
     has_image = bool(videos) or any(b.get("tag") == "figure" for b in nodes)
@@ -526,22 +554,24 @@ def main():
 
     resp = requests.get(FEED, headers={"User-Agent": UA}, timeout=30)
     resp.raise_for_status()
-    feed = feedparser.parse(resp.content)
+    # sanitize_html=False：feedparser 默认会把正文里的 <iframe>（YouTube 播放器）整个删掉，
+    # 导致只有播放器、没有文字链接的文章认不出视频；这里让它保留原样
+    feed = feedparser.parse(resp.content, sanitize_html=False)
 
     failed = False
-    for e in reversed(feed.entries[:15]):
+    for e in reversed(feed.entries[:30]):
         if e.link in posted:
             continue
         if not first_run:
             title = clean(e.title).strip()
             url = e.link  # Telegraph 实在失败时，退回发原链接
+            vids = find_videos(e)
             try:
-                full = build_page_nodes(e)
+                full = build_page_nodes(e, vids)
                 url = publish_page(title, full, simplify(full), minimal_nodes(e, title))
             except Exception as ex:
                 print(f"Telegraph 最终失败，改发原链接（{title[:30]}）:", ex)
             try:
-                vids = video_ids(body_html_of(e))
                 send(bot_token, chat, title, url, vids[0] if vids else None)
             except Exception as ex:
                 print("发送失败:", ex)
