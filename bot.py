@@ -20,6 +20,7 @@ UPLOAD_IMAGES = True
 #    i.ytimg.com / pbs.twimg.com 导致正文无图的问题。想完全用原图地址就改成 False。
 IMG_PROXY = True
 MAX_UPLOADS = 40  # 每次运行最多转存多少张图
+PROBE_BUDGET = 90  # 每次运行最多花多少秒来检查/预热图片（超过就不再检查，照常发帖）
 # ────────────────────────────────────────────────────────────────
 
 # 发帖防重复开关：
@@ -102,14 +103,59 @@ def upload_image(url):
         return None
 
 
+_PROBE_SPENT = 0.0
+
+
+def probe_image(url):
+    """确认图片地址能正常取到（同时让中转服务提前缓存好）。
+    Telegram 生成预览时要去取页面里的图，取得太慢或取不到，预览就会缺图、缺“预览”按钮"""
+    global _PROBE_SPENT
+    if _PROBE_SPENT >= PROBE_BUDGET:
+        return True  # 本次运行检查用的时间已用完，不再检查，按正常处理
+    for i in range(2):
+        t0 = time.time()
+        ok, size, note = False, 0, ""
+        try:
+            r = requests.get(url, headers={"User-Agent": UA}, timeout=20, stream=True)
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if r.status_code == 200 and ctype.startswith("image/"):
+                for chunk in r.iter_content(65536):
+                    size += len(chunk)
+                    if size > 8_000_000:
+                        break
+                ok = size > 0
+            else:
+                note = f"HTTP {r.status_code} {ctype}"
+            r.close()
+        except Exception as ex:
+            note = str(ex)[:80]
+        dt = time.time() - t0
+        _PROBE_SPENT += dt
+        print(f"图片检查{'通过' if ok else '失败'}（{dt:.1f} 秒，{size // 1024} KB {note}）: {url[:90]}")
+        if ok:
+            return True
+        time.sleep(2)
+    return False
+
+
 def final_src(src):
+    """决定每张图最终用哪个地址：转存成功 → /file/...；否则中转地址；中转取不到 → 原图地址；都取不到 → 去掉"""
     if src in _IMG_CACHE:
         return _IMG_CACHE[src]
-    out = None
-    if UPLOAD_IMAGES and src.startswith("http"):
-        out = upload_image(src)
-    if not out:
-        out = proxy_url(src) if (IMG_PROXY and src.startswith("http")) else src
+    if not src.startswith("http"):
+        out = src
+    else:
+        out = upload_image(src) if UPLOAD_IMAGES else None
+        if out is None:
+            cand = proxy_url(src) if IMG_PROXY else src
+            if probe_image(cand):
+                out = cand
+            elif cand != src and probe_image(src):
+                print("中转图片取不到，改用原图地址")
+                out = src
+            else:
+                print("图片取不到，已从页面中去掉")
+                out = None
     _IMG_CACHE[src] = out
     return out
 
@@ -122,7 +168,10 @@ def finalize_images(nodes):
             continue
         n = dict(n)
         if n.get("tag") == "img":
-            n["attrs"] = {**n["attrs"], "src": final_src(n["attrs"]["src"])}
+            s = final_src(n["attrs"]["src"])
+            if s is None:
+                continue
+            n["attrs"] = {**n["attrs"], "src": s}
         elif "children" in n:
             n["children"] = finalize_images(n["children"])
         out.append(n)
@@ -470,7 +519,7 @@ def publish_page(title, full, simple, minimal):
             time.sleep([0, 5, 10, 20][i])
         t = shorten(title, tlen)
         try:
-            url = make_page(get_token(reset=new_acc), t, finalize_images(nodes))
+            url = make_page(get_token(reset=new_acc), t, prune(finalize_images(nodes)))
             if i:
                 print(f"Telegraph 在第 {i + 1} 次（{name}，标题 {len(t)} 字）才成功，内容可能不完整")
             return url
@@ -483,6 +532,20 @@ def publish_page(title, full, simple, minimal):
                 time.sleep(min(int(m.group(1)), 60))
     print("最后一次尝试的内容（前 500 字符）:", json.dumps(plans[-1][1], ensure_ascii=False)[:500])
     raise last
+
+
+def warm_page(url):
+    """发消息前先访问一下 Telegraph 页面，确认它已经能正常打开（Telegram 会马上去抓它来生成预览）"""
+    for i in range(3):
+        try:
+            r = requests.get(url, headers={"User-Agent": UA}, timeout=15)
+            if r.status_code == 200 and len(r.text) > 500:
+                return True
+            print(f"Telegraph 页面检查异常: HTTP {r.status_code}")
+        except Exception as ex:
+            print(f"Telegraph 页面检查失败: {ex}")
+        time.sleep(2)
+    return False
 
 
 def _not_sent(ex):
@@ -571,6 +634,9 @@ def main():
                 url = publish_page(title, full, simplify(full), minimal_nodes(e, title))
             except Exception as ex:
                 print(f"Telegraph 最终失败，改发原链接（{title[:30]}）:", ex)
+            if url.startswith("https://telegra.ph/"):
+                warm_page(url)
+                time.sleep(2)
             try:
                 send(bot_token, chat, title, url, vids[0] if vids else None)
             except Exception as ex:
